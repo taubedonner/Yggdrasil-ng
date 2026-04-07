@@ -475,245 +475,37 @@ pub(crate) struct SessionBuffer {
     pub created: Instant,
 }
 
+
 // ---------------------------------------------------------------------------
-// SessionManager — manages all sessions
+// ConcurrentSessionManager — per-session locking for concurrent crypto
 // ---------------------------------------------------------------------------
 
-/// Manages all encrypted sessions.
-pub(crate) struct SessionManager {
-    pub sessions: HashMap<PublicKey, SessionInfo>,
-    pub buffers: HashMap<PublicKey, SessionBuffer>,
+/// Concurrent session manager with per-session locks.
+///
+/// Unlike `SessionManager` which requires a single global mutex, this
+/// structure uses a `RwLock<HashMap>` for the session map and individual
+/// `Mutex<SessionInfo>` per session.  Traffic encrypt/decrypt for
+/// different peers can proceed concurrently.
+///
+/// Lock ordering (to prevent deadlocks): sessions map → buffers → session.
+pub(crate) struct ConcurrentSessionManager {
+    sessions: std::sync::RwLock<HashMap<PublicKey, Arc<std::sync::Mutex<SessionInfo>>>>,
+    buffers: std::sync::Mutex<HashMap<PublicKey, SessionBuffer>>,
 }
 
-impl SessionManager {
+use std::sync::Arc;
+
+impl ConcurrentSessionManager {
     pub fn new() -> Self {
         Self {
-            sessions: HashMap::new(),
-            buffers: HashMap::new(),
+            sessions: std::sync::RwLock::new(HashMap::new()),
+            buffers: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Create a new session from init message keys.
-    pub fn new_session(
-        &mut self,
-        ed: &PublicKey,
-        init: &SessionInit,
-    ) -> &mut SessionInfo {
-        let mut info = SessionInfo::new(init.current, init.next, init.seq);
-
-        // If there's a buffer, migrate its keys
-        if let Some(buf) = self.buffers.remove(ed) {
-            info.send_pub = buf.init.current;
-            info.send_priv = buf.current_priv;
-            info.next_pub = buf.init.next;
-            info.next_priv = buf.next_priv;
-            info.fix_shared(0, 0);
-        }
-
-        self.sessions.insert(*ed, info);
-        self.sessions.get_mut(ed).unwrap()
-    }
-
-    /// Get or create a session from an init message.
-    /// Returns (session, buffered_data) where buffered_data is Some if a buffer was consumed.
-    pub fn session_for_init(
-        &mut self,
-        ed: &PublicKey,
-        init: &SessionInit,
-    ) -> Option<Vec<u8>> {
-        if self.sessions.contains_key(ed) {
-            return None;
-        }
-
-        let buffered_data = self
-            .buffers
-            .get(ed)
-            .and_then(|b| b.data.clone());
-
-        self.new_session(ed, init);
-        buffered_data
-    }
-
-    /// Handle incoming init message.
-    pub fn handle_init(
-        &mut self,
-        from: &PublicKey,
-        init: &SessionInit,
-        our_ed_priv: &ed25519_dalek::SigningKey,
-    ) -> Vec<OutAction> {
-        let mut actions = Vec::new();
-        let had_session = self.sessions.contains_key(from);
-        let buffered_data = self.session_for_init(from, init);
-
-        if let Some(info) = self.sessions.get_mut(from) {
-            if had_session && init.seq <= info.seq {
-                // Stale Init for an existing session — drop silently.
-                return actions;
-            }
-
-            if init.seq > info.seq {
-                info.handle_update(init);
-            }
-
-            // Send ack
-            let ack_init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
-            if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
-                actions.push(OutAction::SendToInner {
-                    dest: *from,
-                    data,
-                });
-            }
-
-            // Send buffered data
-            if let Some(buf_data) = buffered_data {
-                if let Ok(traffic_data) = info.do_send(&buf_data) {
-                    actions.push(OutAction::SendToInner {
-                        dest: *from,
-                        data: traffic_data,
-                    });
-                }
-            }
-        }
-
-        actions
-    }
-
-    /// Handle incoming ack message.
-    pub fn handle_ack(
-        &mut self,
-        from: &PublicKey,
-        ack: &SessionInit,
-        _our_ed_priv: &ed25519_dalek::SigningKey,
-    ) -> Vec<OutAction> {
-        let mut actions = Vec::new();
-        let is_old = self.sessions.contains_key(from);
-
-        let buffered_data = self.session_for_init(from, ack);
-
-        if let Some(info) = self.sessions.get_mut(from) {
-            if is_old {
-                // Existing session: treat as ack
-                if ack.seq > info.seq {
-                    info.handle_update(ack);
-                }
-            } else {
-                // New session from ack: handle as init
-                if ack.seq > info.seq {
-                    info.handle_update(ack);
-                }
-            }
-
-            // Send buffered data
-            if let Some(buf_data) = buffered_data {
-                if let Ok(traffic_data) = info.do_send(&buf_data) {
-                    actions.push(OutAction::SendToInner {
-                        dest: *from,
-                        data: traffic_data,
-                    });
-                }
-            }
-        }
-
-        actions
-    }
-
-    /// Handle incoming traffic message.
-    pub fn handle_traffic(
-        &mut self,
-        from: &PublicKey,
-        data: &[u8],
-        our_ed_priv: &ed25519_dalek::SigningKey,
-    ) -> Vec<OutAction> {
-        let mut actions = Vec::new();
-
-        if let Some(info) = self.sessions.get_mut(from) {
-            match info.do_recv(data) {
-                Ok(payload) => {
-                    actions.push(OutAction::Deliver {
-                        source: *from,
-                        data: payload,
-                    });
-                }
-                Err(RecvAction::SendInit) => {
-                    // Send init to resync
-                    let init =
-                        SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
-                    if let Ok(data) = init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
-                        actions.push(OutAction::SendToInner {
-                            dest: *from,
-                            data,
-                        });
-                    }
-                }
-                Err(RecvAction::Drop) => {}
-            }
-        } else {
-            // Unknown sender — drop silently.
-            tracing::debug!("encrypted: dropping traffic from unknown sender {:?}", hex::encode(&from[..4]));
-        }
-
-        actions
-    }
-
-    /// Handle outbound write.
-    pub fn write_to(
-        &mut self,
-        dest: &PublicKey,
-        msg: &[u8],
-        our_ed_priv: &ed25519_dalek::SigningKey,
-    ) -> Vec<OutAction> {
-        let mut actions = Vec::new();
-
-        if let Some(info) = self.sessions.get_mut(dest) {
-            if let Ok(traffic_data) = info.do_send(msg) {
-                actions.push(OutAction::SendToInner {
-                    dest: *dest,
-                    data: traffic_data,
-                });
-            }
-        } else {
-            actions.extend(self.buffer_and_init(dest, msg, our_ed_priv));
-        }
-
-        actions
-    }
-
-    /// Buffer data and send init for a new session.
-    fn buffer_and_init(
-        &mut self,
-        dest: &PublicKey,
-        msg: &[u8],
-        our_ed_priv: &ed25519_dalek::SigningKey,
-    ) -> Vec<OutAction> {
-        let mut actions = Vec::new();
-
-        let buf = self.buffers.entry(*dest).or_insert_with(|| {
-            let (current_pub, current_priv) = new_box_keys();
-            let (next_pub, next_priv) = new_box_keys();
-            SessionBuffer {
-                data: None,
-                init: SessionInit::new(&current_pub, &next_pub, 0),
-                current_priv,
-                next_priv,
-                created: Instant::now(),
-            }
-        });
-
-        buf.data = Some(msg.to_vec());
-
-        if let Ok(data) = buf.init.encrypt(our_ed_priv, dest, SESSION_TYPE_INIT) {
-            actions.push(OutAction::SendToInner {
-                dest: *dest,
-                data,
-            });
-        }
-
-        actions
-    }
-
-    /// Handle incoming data (dispatch by message type).
+    /// Dispatch incoming data by message type (no locking at this level).
     pub fn handle_data(
-        &mut self,
+        &self,
         from: &PublicKey,
         data: &[u8],
         our_curve_priv: &CurvePrivateKey,
@@ -744,10 +536,283 @@ impl SessionManager {
         }
     }
 
+    /// Handle incoming traffic (hot path).
+    /// Read-locks the map, clones the session Arc, drops the map lock,
+    /// then locks only the per-session mutex for decryption.
+    fn handle_traffic(
+        &self,
+        from: &PublicKey,
+        data: &[u8],
+        our_ed_priv: &ed25519_dalek::SigningKey,
+    ) -> Vec<OutAction> {
+        let session_arc = {
+            let map = self.sessions.read().unwrap();
+            map.get(from).cloned()
+        };
+
+        let Some(session_arc) = session_arc else {
+            tracing::debug!("encrypted: dropping traffic from unknown sender {:?}", hex::encode(&from[..4]));
+            return Vec::new();
+        };
+
+        let mut info = session_arc.lock().unwrap();
+        match info.do_recv(data) {
+            Ok(payload) => {
+                vec![OutAction::Deliver {
+                    source: *from,
+                    data: payload,
+                }]
+            }
+            Err(RecvAction::SendInit) => {
+                let init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
+                match init.encrypt(our_ed_priv, from, SESSION_TYPE_INIT) {
+                    Ok(data) => vec![OutAction::SendToInner { dest: *from, data }],
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(RecvAction::Drop) => Vec::new(),
+        }
+    }
+
+    /// Encrypt and send outbound data (hot path).
+    /// Read-locks the map for existing sessions; falls back to buffer_and_init
+    /// for new sessions.
+    pub fn write_to(
+        &self,
+        dest: &PublicKey,
+        msg: &[u8],
+        our_ed_priv: &ed25519_dalek::SigningKey,
+    ) -> Vec<OutAction> {
+        let session_arc = {
+            let map = self.sessions.read().unwrap();
+            map.get(dest).cloned()
+        };
+
+        if let Some(session_arc) = session_arc {
+            let mut info = session_arc.lock().unwrap();
+            match info.do_send(msg) {
+                Ok(traffic_data) => vec![OutAction::SendToInner {
+                    dest: *dest,
+                    data: traffic_data,
+                }],
+                Err(_) => Vec::new(),
+            }
+        } else {
+            self.buffer_and_init(dest, msg, our_ed_priv)
+        }
+    }
+
+    /// Handle incoming init message (cold path).
+    fn handle_init(
+        &self,
+        from: &PublicKey,
+        init: &SessionInit,
+        our_ed_priv: &ed25519_dalek::SigningKey,
+    ) -> Vec<OutAction> {
+        let mut actions = Vec::new();
+
+        // Try read-lock first: existing session?
+        let existing = {
+            let map = self.sessions.read().unwrap();
+            map.get(from).cloned()
+        };
+
+        if let Some(session_arc) = existing {
+            // Existing session: update under per-session lock
+            let mut info = session_arc.lock().unwrap();
+            if init.seq <= info.seq {
+                return actions; // stale
+            }
+            info.handle_update(init);
+
+            // Send ack
+            let ack_init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
+            if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
+                actions.push(OutAction::SendToInner { dest: *from, data });
+            }
+        } else {
+            // New session: need write lock on map
+            let mut map = self.sessions.write().unwrap();
+
+            // Double-check: another thread may have inserted between read and write
+            if let Some(session_arc) = map.get(from).cloned() {
+                drop(map);
+                let mut info = session_arc.lock().unwrap();
+                if init.seq <= info.seq {
+                    return actions;
+                }
+                info.handle_update(init);
+                let ack_init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
+                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
+                    actions.push(OutAction::SendToInner { dest: *from, data });
+                }
+            } else {
+                // Create new session, consume buffer
+                let (buffered_data, mut info) = self.create_session_from_init(from, init);
+                let ack_init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
+
+                // Send buffered data if any
+                if let Some(buf_data) = buffered_data {
+                    if let Ok(traffic_data) = info.do_send(&buf_data) {
+                        actions.push(OutAction::SendToInner {
+                            dest: *from,
+                            data: traffic_data,
+                        });
+                    }
+                }
+
+                let session_arc = Arc::new(std::sync::Mutex::new(info));
+                map.insert(*from, session_arc);
+                drop(map);
+
+                // Send ack
+                if let Ok(data) = ack_init.encrypt(our_ed_priv, from, SESSION_TYPE_ACK) {
+                    actions.push(OutAction::SendToInner { dest: *from, data });
+                }
+            }
+        }
+
+        actions
+    }
+
+    /// Handle incoming ack message (cold path).
+    fn handle_ack(
+        &self,
+        from: &PublicKey,
+        ack: &SessionInit,
+        _our_ed_priv: &ed25519_dalek::SigningKey,
+    ) -> Vec<OutAction> {
+        let mut actions = Vec::new();
+
+        // Try read-lock first: existing session?
+        let existing = {
+            let map = self.sessions.read().unwrap();
+            map.get(from).cloned()
+        };
+
+        if let Some(session_arc) = existing {
+            let mut info = session_arc.lock().unwrap();
+            if ack.seq > info.seq {
+                info.handle_update(ack);
+            }
+        } else {
+            // New session from ack: need write lock
+            let mut map = self.sessions.write().unwrap();
+
+            // Double-check
+            if let Some(session_arc) = map.get(from).cloned() {
+                drop(map);
+                let mut info = session_arc.lock().unwrap();
+                if ack.seq > info.seq {
+                    info.handle_update(ack);
+                }
+            } else {
+                let (buffered_data, mut info) = self.create_session_from_init(from, ack);
+
+                if ack.seq > info.seq {
+                    info.handle_update(ack);
+                }
+
+                // Send buffered data
+                if let Some(buf_data) = buffered_data {
+                    if let Ok(traffic_data) = info.do_send(&buf_data) {
+                        actions.push(OutAction::SendToInner {
+                            dest: *from,
+                            data: traffic_data,
+                        });
+                    }
+                }
+
+                let session_arc = Arc::new(std::sync::Mutex::new(info));
+                map.insert(*from, session_arc);
+            }
+        }
+
+        actions
+    }
+
+    /// Create a new SessionInfo from init keys, consuming any pending buffer.
+    /// Must be called while holding the buffers lock is NOT held (acquires it internally).
+    fn create_session_from_init(
+        &self,
+        ed: &PublicKey,
+        init: &SessionInit,
+    ) -> (Option<Vec<u8>>, SessionInfo) {
+        let mut info = SessionInfo::new(init.current, init.next, init.seq);
+
+        let mut buffers = self.buffers.lock().unwrap();
+        let buffered_data = if let Some(buf) = buffers.remove(ed) {
+            info.send_pub = buf.init.current;
+            info.send_priv = buf.current_priv;
+            info.next_pub = buf.init.next;
+            info.next_priv = buf.next_priv;
+            info.fix_shared(0, 0);
+            buf.data
+        } else {
+            None
+        };
+
+        (buffered_data, info)
+    }
+
+    /// Buffer data and send init for a new session (cold path).
+    fn buffer_and_init(
+        &self,
+        dest: &PublicKey,
+        msg: &[u8],
+        our_ed_priv: &ed25519_dalek::SigningKey,
+    ) -> Vec<OutAction> {
+        let mut actions = Vec::new();
+
+        let mut buffers = self.buffers.lock().unwrap();
+        let buf = buffers.entry(*dest).or_insert_with(|| {
+            let (current_pub, current_priv) = new_box_keys();
+            let (next_pub, next_priv) = new_box_keys();
+            SessionBuffer {
+                data: None,
+                init: SessionInit::new(&current_pub, &next_pub, 0),
+                current_priv,
+                next_priv,
+                created: Instant::now(),
+            }
+        });
+
+        buf.data = Some(msg.to_vec());
+
+        if let Ok(data) = buf.init.encrypt(our_ed_priv, dest, SESSION_TYPE_INIT) {
+            actions.push(OutAction::SendToInner {
+                dest: *dest,
+                data,
+            });
+        }
+
+        actions
+    }
+
     /// Clean up expired sessions and buffers.
-    pub fn cleanup_expired(&mut self) {
-        self.sessions.retain(|_, info| !info.is_expired());
-        self.buffers.retain(|_, buf| buf.created.elapsed() < SESSION_TIMEOUT);
+    pub fn cleanup_expired(&self) {
+        {
+            let mut map = self.sessions.write().unwrap();
+            map.retain(|_, session_arc| {
+                let info = session_arc.lock().unwrap();
+                !info.is_expired()
+            });
+        }
+        {
+            let mut buffers = self.buffers.lock().unwrap();
+            buffers.retain(|_, buf| buf.created.elapsed() < SESSION_TIMEOUT);
+        }
+    }
+
+    /// Get snapshot of all active sessions for stats.
+    pub fn get_all_sessions(&self) -> Vec<(PublicKey, u64, u64, Instant)> {
+        let map = self.sessions.read().unwrap();
+        let mut result = Vec::with_capacity(map.len());
+        for (key, session_arc) in map.iter() {
+            let info = session_arc.lock().unwrap();
+            result.push((*key, info.tx, info.rx, info.since));
+        }
+        result
     }
 }
 
@@ -813,8 +878,8 @@ mod tests {
         let (priv_a, pub_a, curve_priv_a) = make_keys();
         let (priv_b, pub_b, curve_priv_b) = make_keys();
 
-        let mut mgr_a = SessionManager::new();
-        let mut mgr_b = SessionManager::new();
+        let mgr_a = ConcurrentSessionManager::new();
+        let mgr_b = ConcurrentSessionManager::new();
 
         // A writes to B (triggers buffer + init)
         let actions = mgr_a.write_to(&pub_b, b"hello from A", &priv_a);
@@ -860,8 +925,8 @@ mod tests {
         let (priv_a, pub_a, curve_priv_a) = make_keys();
         let (priv_b, pub_b, curve_priv_b) = make_keys();
 
-        let mut mgr_a = SessionManager::new();
-        let mut mgr_b = SessionManager::new();
+        let mgr_a = ConcurrentSessionManager::new();
+        let mgr_b = ConcurrentSessionManager::new();
 
         // Establish session: A→B init, B→A ack
         let a_actions = mgr_a.write_to(&pub_b, b"msg1", &priv_a);

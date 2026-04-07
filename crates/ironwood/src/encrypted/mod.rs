@@ -19,7 +19,7 @@ use crate::core::PacketConnImpl;
 use crate::types::{Addr, Error, Result};
 
 use self::crypto::{ed25519_private_to_curve25519, CurvePrivateKey};
-use self::session::{OutAction, SessionManager, SESSION_TRAFFIC_OVERHEAD};
+use self::session::{ConcurrentSessionManager, OutAction, SESSION_TRAFFIC_OVERHEAD};
 
 /// Channel capacity for delivering decrypted traffic to readers.
 /// Must be large enough to absorb bursts without blocking the decrypt loop,
@@ -48,8 +48,8 @@ pub struct EncryptedPacketConn {
     inner: Arc<PacketConnImpl>,
     /// Our Ed25519 signing key.
     signing_key: SigningKey,
-    /// Session manager (shared with reader task).
-    sessions: Arc<Mutex<SessionManager>>,
+    /// Session manager with per-session locking (shared with reader task).
+    sessions: Arc<ConcurrentSessionManager>,
     /// Channel for delivering decrypted traffic to read_from.
     recv_rx: Mutex<mpsc::Receiver<DecryptedMessage>>,
     recv_tx: mpsc::Sender<DecryptedMessage>,
@@ -68,7 +68,7 @@ impl EncryptedPacketConn {
     pub fn new(secret: SigningKey, config: Config) -> Self {
         let curve_priv = ed25519_private_to_curve25519(&secret);
         let inner = Arc::new(PacketConnImpl::new(secret.clone(), config));
-        let sessions = Arc::new(Mutex::new(SessionManager::new()));
+        let sessions = Arc::new(ConcurrentSessionManager::new());
         let (recv_tx, recv_rx) = mpsc::channel(RECV_CHANNEL_SIZE);
         let cancel = CancellationToken::new();
 
@@ -138,15 +138,15 @@ impl EncryptedPacketConn {
     /// Get all active encrypted sessions.
     pub async fn get_sessions(&self) -> Vec<SessionEntry> {
         use std::time::Instant;
-        let sessions = self.sessions.lock().await;
         let now = Instant::now();
-        let mut result = Vec::new();
-        for (key, info) in &sessions.sessions {
+        let snapshot = self.sessions.get_all_sessions();
+        let mut result = Vec::with_capacity(snapshot.len());
+        for (key, tx, rx, since) in snapshot {
             result.push(SessionEntry {
-                key: *key,
-                uptime_seconds: now.duration_since(info.since).as_secs_f64(),
-                bytes_sent: info.tx,
-                bytes_recvd: info.rx,
+                key,
+                uptime_seconds: now.duration_since(since).as_secs_f64(),
+                bytes_sent: tx,
+                bytes_recvd: rx,
             });
         }
         result.sort_by(|a, b| a.key.cmp(&b.key));
@@ -179,7 +179,7 @@ impl EncryptedPacketConn {
 /// Background reader loop: reads from inner PacketConn, decrypts via sessions, delivers.
 /// Background task that periodically cleans up expired sessions and buffers.
 /// Runs every 30 seconds to remove sessions/buffers older than SESSION_TIMEOUT (60s).
-async fn session_cleanup_loop(sessions: Arc<Mutex<SessionManager>>, cancel: CancellationToken) {
+async fn session_cleanup_loop(sessions: Arc<ConcurrentSessionManager>, cancel: CancellationToken) {
     use std::time::Duration;
 
     let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -189,8 +189,7 @@ async fn session_cleanup_loop(sessions: Arc<Mutex<SessionManager>>, cancel: Canc
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = interval.tick() => {
-                let mut mgr = sessions.lock().await;
-                mgr.cleanup_expired();
+                sessions.cleanup_expired();
             }
         }
     }
@@ -198,7 +197,7 @@ async fn session_cleanup_loop(sessions: Arc<Mutex<SessionManager>>, cancel: Canc
 
 async fn encrypted_reader_loop(
     inner: Arc<PacketConnImpl>,
-    sessions: Arc<Mutex<SessionManager>>,
+    sessions: Arc<ConcurrentSessionManager>,
     recv_tx: mpsc::Sender<DecryptedMessage>,
     cancel: CancellationToken,
     signing_key: SigningKey,
@@ -223,13 +222,10 @@ async fn encrypted_reader_loop(
         let from_key = from_addr.0;
         let data = buf[..n].to_vec();
 
-        // Decrypt via session manager
-        let actions = {
-            let mut mgr = sessions.lock().await;
-            mgr.handle_data(&from_key, &data, &curve_priv, &signing_key)
-        };
+        // Decrypt via session manager (per-session locking, no global mutex)
+        let actions = sessions.handle_data(&from_key, &data, &curve_priv, &signing_key);
 
-        // Process actions
+        // Process actions (all locks already released)
         for action in actions {
             match action {
                 OutAction::SendToInner { dest, data } => {
@@ -283,10 +279,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
 
         let dest = addr.0;
 
-        let actions = {
-            let mut mgr = self.sessions.lock().await;
-            mgr.write_to(&dest, buf, &self.signing_key)
-        };
+        let actions = self.sessions.write_to(&dest, buf, &self.signing_key);
 
         for action in actions {
             match action {
