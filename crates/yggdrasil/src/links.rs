@@ -106,6 +106,7 @@ pub struct LinkOptions {
     pub priority: u8,
     pub password: Vec<u8>,
     pub max_backoff: Duration,
+    pub tls_sni: Option<String>,
 }
 
 impl Default for LinkOptions {
@@ -115,6 +116,7 @@ impl Default for LinkOptions {
             priority: 0,
             password: Vec::new(),
             max_backoff: DEFAULT_BACKOFF_LIMIT,
+            tls_sni: None,
         }
     }
 }
@@ -678,24 +680,28 @@ impl Links {
         let port = url.port().ok_or("missing port")?;
         let target = format!("{}:{}", host, port);
 
-        // Resolve DNS to detect duplicates (e.g., same peer via IP and domain)
-        let mut resolved_addrs: Vec<_> = tokio::net::lookup_host(&target)
-            .await
-            .map_err(|e| format!("DNS lookup failed for {}: {}", target, e))?
-            .collect();
-        resolved_addrs.sort();
+        // Attempt DNS resolution for duplicate detection.
+        // If DNS fails (e.g. device is offline), skip the check and let the
+        // reconnect loop retry DNS + connect with its own backoff.
+        let addr_key: Option<String> = match tokio::net::lookup_host(&target).await {
+            Ok(addrs) => {
+                let mut resolved: Vec<_> = addrs.collect();
+                resolved.sort();
 
-        // Check if any resolved IP:port is already connected
-        for addr in &resolved_addrs {
-            let addr_key = addr.to_string();
-            if let Some(existing_uri) = self.peer_addrs.get(&addr_key) {
-                return Err(format!("peer {} already connected as {} (resolves to same address {})", uri, existing_uri, addr_key));
+                // Check if any resolved IP:port is already connected
+                for addr in &resolved {
+                    let ak = addr.to_string();
+                    if let Some(existing_uri) = self.peer_addrs.get(&ak) {
+                        return Err(format!("peer {} already connected as {} (resolves to same address {})", uri, existing_uri, ak));
+                    }
+                }
+                resolved.first().map(|a| a.to_string())
             }
-        }
-
-        // Get the primary address for tracking
-        let primary_addr = resolved_addrs.first().ok_or("failed to resolve address")?;
-        let addr_key = primary_addr.to_string();
+            Err(e) => {
+                tracing::warn!("DNS lookup failed for {} ({}), skipping duplicate check — will retry in reconnect loop", target, e);
+                None
+            }
+        };
 
         let options = parse_link_options(&url)?;
         let core = self.core()?;
@@ -736,8 +742,9 @@ impl Links {
 
                         // Perform TLS handshake if needed
                         let wrapped_stream = if let Some(ref connector) = tls_connector {
-                            // Use the hostname from the URI for SNI
-                            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                            // Use SNI from options (explicit ?sni= or hostname fallback), else raw host
+                            let sni_host = options.tls_sni.clone().unwrap_or_else(|| host.clone());
+                            let server_name = rustls::pki_types::ServerName::try_from(sni_host.as_str().to_owned())
                                 .unwrap_or_else(|_| {
                                     // Fallback to using IP address as server name if hostname parsing fails
                                     rustls::pki_types::ServerName::IpAddress(
@@ -809,7 +816,9 @@ impl Links {
         });
 
         self.peers.insert(uri.to_string(), PeerEntry { cancel, handle });
-        self.peer_addrs.insert(addr_key, uri.to_string());
+        if let Some(ak) = addr_key {
+            self.peer_addrs.insert(ak, uri.to_string());
+        }
         Ok(())
     }
 
@@ -1045,6 +1054,47 @@ async fn handle_connection(
     result
 }
 
+/// Parse a duration string that accepts either plain seconds ("300") or
+/// Go-style duration components ("5m", "1h30m", "2h30m15s").
+fn parse_duration_string(s: &str) -> Result<Duration, String> {
+    // Try plain integer seconds first (backwards compatibility)
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(Duration::from_secs(secs));
+    }
+
+    let mut total_secs: u64 = 0;
+    let mut current_num = String::new();
+    let mut has_unit = false;
+
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            current_num.push(ch);
+        } else {
+            let n: u64 = current_num
+                .parse()
+                .map_err(|_| format!("invalid duration: {}", s))?;
+            current_num.clear();
+            match ch {
+                'h' => total_secs += n * 3600,
+                'm' => total_secs += n * 60,
+                's' => total_secs += n,
+                _ => return Err(format!("invalid duration unit '{}' in: {}", ch, s)),
+            }
+            has_unit = true;
+        }
+    }
+
+    if !current_num.is_empty() && !has_unit {
+        return Err(format!("invalid duration: {}", s));
+    }
+    // Trailing number without unit (e.g., "5m30") is an error
+    if !current_num.is_empty() {
+        return Err(format!("trailing number without unit in duration: {}", s));
+    }
+
+    Ok(Duration::from_secs(total_secs))
+}
+
 /// Parse link options from a URL's query parameters.
 fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
     let mut opts = LinkOptions::default();
@@ -1073,10 +1123,8 @@ fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
                 opts.password = value.as_bytes().to_vec();
             }
             "maxbackoff" => {
-                let secs: u64 = value
-                    .parse()
+                let dur = parse_duration_string(value.as_ref())
                     .map_err(|e| format!("invalid maxbackoff: {}", e))?;
-                let dur = Duration::from_secs(secs);
                 if dur < MINIMUM_BACKOFF_LIMIT {
                     return Err(format!(
                         "maxbackoff must be at least {} seconds",
@@ -1085,9 +1133,102 @@ fn parse_link_options(url: &Url) -> Result<LinkOptions, String> {
                 }
                 opts.max_backoff = dur;
             }
+            "sni" => {
+                let sni = value.as_ref();
+                // SNI must be a hostname, not an IP address
+                if !sni.is_empty() && sni.parse::<std::net::IpAddr>().is_err() {
+                    opts.tls_sni = Some(sni.to_string());
+                }
+            }
             _ => {}
         }
     }
 
+    // If no explicit SNI was set, fall back to URI hostname (if not an IP)
+    if opts.tls_sni.is_none() {
+        if let Some(host) = url.host_str() {
+            if host.parse::<std::net::IpAddr>().is_err() {
+                opts.tls_sni = Some(host.to_string());
+            }
+        }
+    }
+
     Ok(opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_duration_string_plain_seconds() {
+        assert_eq!(parse_duration_string("300").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration_string("0").unwrap(), Duration::from_secs(0));
+        assert_eq!(parse_duration_string("4096").unwrap(), Duration::from_secs(4096));
+    }
+
+    #[test]
+    fn test_parse_duration_string_units() {
+        assert_eq!(parse_duration_string("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration_string("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration_string("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration_string("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration_string("2h30m15s").unwrap(), Duration::from_secs(9015));
+    }
+
+    #[test]
+    fn test_parse_duration_string_invalid() {
+        assert!(parse_duration_string("abc").is_err());
+        assert!(parse_duration_string("5x").is_err());
+        assert!(parse_duration_string("5m30").is_err()); // trailing number without unit
+    }
+
+    #[test]
+    fn test_parse_link_options_sni_hostname() {
+        let url = Url::parse("tls://example.com:12345?sni=custom.host.com").unwrap();
+        let opts = parse_link_options(&url).unwrap();
+        assert_eq!(opts.tls_sni, Some("custom.host.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_link_options_sni_ip_rejected() {
+        let url = Url::parse("tls://example.com:12345?sni=1.2.3.4").unwrap();
+        let opts = parse_link_options(&url).unwrap();
+        // Explicit IP in sni is rejected, falls back to URI hostname
+        assert_eq!(opts.tls_sni, Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_link_options_sni_fallback_to_hostname() {
+        let url = Url::parse("tls://peer.example.com:12345").unwrap();
+        let opts = parse_link_options(&url).unwrap();
+        assert_eq!(opts.tls_sni, Some("peer.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_link_options_sni_no_fallback_for_ip() {
+        let url = Url::parse("tls://192.168.1.1:12345").unwrap();
+        let opts = parse_link_options(&url).unwrap();
+        assert_eq!(opts.tls_sni, None);
+    }
+
+    #[test]
+    fn test_parse_link_options_maxbackoff_duration_string() {
+        let url = Url::parse("tcp://example.com:12345?maxbackoff=5m").unwrap();
+        let opts = parse_link_options(&url).unwrap();
+        assert_eq!(opts.max_backoff, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_parse_link_options_maxbackoff_seconds() {
+        let url = Url::parse("tcp://example.com:12345?maxbackoff=600").unwrap();
+        let opts = parse_link_options(&url).unwrap();
+        assert_eq!(opts.max_backoff, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_parse_link_options_maxbackoff_too_small() {
+        let url = Url::parse("tcp://example.com:12345?maxbackoff=3s").unwrap();
+        assert!(parse_link_options(&url).is_err());
+    }
 }
