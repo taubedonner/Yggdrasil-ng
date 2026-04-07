@@ -3,7 +3,19 @@ resolver = "2"
 members = ["crates/ironwood", "crates/yggdrasil"]
 
 [profile.release]
-opt-level = 2       # Optimize for speed
+opt-level = 3       # Optimize for speed
 lto = true          # Link-time optimization
 codegen-units = 1   # Better optimization, slower compile
 strip = true        # Strip symbols
+
+[profile.small]
+inherits = "release"
+opt-level = "z"      # Оптимизация строго по размеру (лучше, чем 2)
+lto = true
+codegen-units = 1
+strip = "symbols"    # Полное удаление символов (включая debuginfo)
+panic = "abort"      # Убирает код развертывания паник
+incremental = false
+debug = false
+rpath = false
+overflow-checks = false

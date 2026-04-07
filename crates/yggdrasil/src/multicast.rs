@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blake2::Blake2b512;
-use network_interface::{Addr as NiAddr, NetworkInterface, NetworkInterfaceConfig};
+use getifaddrs::{self, InterfaceFlags};
 use regex::Regex;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -239,39 +239,78 @@ fn create_multicast_socket() -> std::io::Result<Socket> {
 
 // ── Interface discovery ──────────────────────────────────────────────────
 
+/// Intermediate: collects per-interface data from the getifaddrs iterator.
+struct IfInfo {
+    index: u32,
+    addrs: Vec<Ipv6Addr>,
+}
+
+/// Get the display name for an interface entry.
+/// On Windows, getifaddrs returns internal names like "ethernet_32778" in `name`,
+/// but the human-readable name ("Ethernet", "Wi-Fi") is in `description`.
+fn interface_display_name(entry: &getifaddrs::Interface) -> String {
+    #[cfg(windows)]
+    {
+        if !entry.description.is_empty() {
+            return entry.description.clone();
+        }
+    }
+    entry.name.clone()
+}
+
 /// Enumerate system interfaces and match against configured patterns.
-/// Returns map of interface_name -> InterfaceState.
-fn discover_interfaces(
-    core: &Core,
-    patterns: &[(Regex, MulticastInterfaceConfig)],
-) -> HashMap<String, InterfaceState> {
+/// Returns map of display_name -> InterfaceState.
+fn discover_interfaces(core: &Core, patterns: &[(Regex, MulticastInterfaceConfig)]) -> HashMap<String, InterfaceState> {
     let mut result = HashMap::new();
 
-    let ifaces = match NetworkInterface::show() {
-        Ok(ifaces) => ifaces,
+    let entries = match getifaddrs::getifaddrs() {
+        Ok(it) => it,
         Err(e) => {
             tracing::warn!("Failed to enumerate network interfaces: {}", e);
             return result;
         }
     };
 
-    let pk = core.public_key();
+    // getifaddrs returns one entry per (interface, address) pair.
+    // Group by display name, collecting link-local IPv6 addresses and flags.
+    let mut by_name: HashMap<String, IfInfo> = HashMap::new();
 
-    for iface in &ifaces {
-        // Collect IPv6 link-local addresses
-        let mut link_local_addrs = Vec::new();
-        for addr in &iface.addr {
-            if let NiAddr::V6(v6) = addr {
-                let ip = v6.ip;
-                // Check for link-local (fe80::/10)
-                let segments = ip.segments();
-                if segments[0] & 0xffc0 == 0xfe80 {
-                    link_local_addrs.push(ip);
-                }
+    for entry in entries {
+        let flags = entry.flags;
+
+        // Apply Go-equivalent flag filters:
+        // - Must be up
+        // - Must be running
+        // - Must support multicast
+        // - Must NOT be point-to-point (VPN tunnels, PPP)
+        // - Must NOT be loopback
+        if !flags.contains(InterfaceFlags::UP) { continue; }
+        if !flags.contains(InterfaceFlags::RUNNING) { continue; }
+        if !flags.contains(InterfaceFlags::MULTICAST) { continue; }
+        if flags.contains(InterfaceFlags::POINTTOPOINT) { continue; }
+        if flags.contains(InterfaceFlags::LOOPBACK) { continue; }
+
+        let index = entry.index.unwrap_or(0);
+        let display_name = interface_display_name(&entry);
+
+        // Check for IPv6 link-local address
+        if let getifaddrs::Address::V6(v6) = &entry.address {
+            let ip = v6.address;
+            let segments = ip.segments();
+            if segments[0] & 0xffc0 == 0xfe80 {
+                let info = by_name.entry(display_name).or_insert_with(|| IfInfo {
+                    index,
+                    addrs: Vec::new(),
+                });
+                info.addrs.push(ip);
             }
         }
+    }
 
-        if link_local_addrs.is_empty() {
+    let pk = core.public_key();
+
+    for (name, info) in &by_name {
+        if info.addrs.is_empty() {
             continue;
         }
 
@@ -280,16 +319,16 @@ fn discover_interfaces(
             if !cfg.beacon && !cfg.listen {
                 continue;
             }
-            if !re.is_match(&iface.name) {
+            if !re.is_match(name) {
                 continue;
             }
 
             let password = cfg.password.as_bytes().to_vec();
             let hash = compute_auth_hash(pk, &password);
 
-            result.insert(iface.name.clone(), InterfaceState {
-                index: iface.index,
-                addrs: link_local_addrs,
+            result.insert(name.clone(), InterfaceState {
+                index: info.index,
+                addrs: info.addrs.clone(),
                 beacon: cfg.beacon,
                 listen: cfg.listen,
                 port: cfg.port,
