@@ -83,12 +83,17 @@ impl Core {
         let active_links = ActiveLinks::new();
 
         // Generate self-signed TLS certificate
-        let (tls_certs, tls_key, cert_expiry) = tls_support::generate_self_signed_cert(&signing_key)
+        let tls_material = tls_support::generate_self_signed_cert(&signing_key)
             .expect("failed to generate TLS certificate");
-        let tls_server_config = tls_support::create_server_config(tls_certs, tls_key)
-            .expect("failed to create TLS server config");
-        let tls_client_config = tls_support::create_client_config()
-            .expect("failed to create TLS client config");
+        let tls_server_config = tls_support::create_server_config(
+            tls_material.cert_chain(),
+            tls_material.private_key().expect("invalid private key"),
+        ).expect("failed to create TLS server config");
+        let tls_client_config = tls_support::create_client_config(
+            tls_material.cert_chain(),
+            tls_material.private_key().expect("invalid private key"),
+        ).expect("failed to create TLS client config");
+        let cert_expiry = tls_material.expiry;
 
         let tls_server_config = Arc::new(RwLock::new(tls_server_config));
         let tls_client_config = Arc::new(RwLock::new(tls_client_config));
@@ -506,16 +511,21 @@ impl Core {
 
                 // Generate new certificate
                 match tls_support::generate_self_signed_cert(&self.signing_key) {
-                    Ok((certs, key, new_expiry)) => {
-                        match (
-                            tls_support::create_server_config(certs, key),
-                            tls_support::create_client_config(),
-                        ) {
+                    Ok(material) => {
+                        let server_result = tls_support::create_server_config(
+                            material.cert_chain(),
+                            material.private_key().unwrap(),
+                        );
+                        let client_result = tls_support::create_client_config(
+                            material.cert_chain(),
+                            material.private_key().unwrap(),
+                        );
+                        match (server_result, client_result) {
                             (Ok(server_config), Ok(client_config)) => {
                                 // Update configs
                                 *self.tls_server_config.write().await = server_config;
                                 *self.tls_client_config.write().await = client_config;
-                                *self.tls_cert_expiry.write().await = new_expiry;
+                                *self.tls_cert_expiry.write().await = material.expiry;
 
                                 tracing::info!("TLS certificate renewed successfully");
                             }

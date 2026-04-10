@@ -14,7 +14,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
 
+use rustls::pki_types::CertificateDer;
+
 use crate::core::Core;
+use crate::tls_support::extract_ed25519_pubkey_from_cert;
 use crate::version::Metadata;
 
 /// Enum to handle both TCP and TLS streams uniformly.
@@ -30,6 +33,22 @@ impl Stream {
             Stream::Tcp(s) => s.peer_addr(),
             Stream::Tls(s) => s.get_ref().0.peer_addr(),
             Stream::TlsClient(s) => s.get_ref().0.peer_addr(),
+        }
+    }
+
+    /// Extract the first peer certificate from a TLS connection.
+    /// Returns `None` for plain TCP or if no peer certificate is available.
+    fn peer_tls_cert(&self) -> Option<&CertificateDer<'static>> {
+        match self {
+            Stream::Tcp(_) => None,
+            Stream::Tls(s) => {
+                // Server-side: client cert available if client sent one (optional)
+                s.get_ref().1.peer_certificates()?.first()
+            }
+            Stream::TlsClient(s) => {
+                // Client-side: server's certificate
+                s.get_ref().1.peer_certificates()?.first()
+            }
         }
     }
 }
@@ -935,6 +954,30 @@ pub(crate) async fn handle_connection(
     .map_err(|_| "handshake timed out".to_string())?;
 
     let remote_meta = result?;
+
+    // Verify TLS certificate matches meta handshake pubkey (outbound/client-side only)
+    if let Some(peer_cert) = stream.peer_tls_cert() {
+        match extract_ed25519_pubkey_from_cert(peer_cert.as_ref()) {
+            Some(tls_pubkey) if tls_pubkey != remote_meta.public_key => {
+                let err_msg = "TLS certificate pubkey does not match meta handshake pubkey";
+                tracing::warn!("{} from {}", err_msg, uri);
+                if let Some(ip) = peer_ip {
+                    active.ban_list.record_failure(ip, err_msg).await;
+                }
+                return Err(err_msg.to_string());
+            }
+            Some(_) => {
+                tracing::debug!("TLS certificate pubkey verified for {}", uri);
+            }
+            None => {
+                // Peer is using a non-ed25519 cert (e.g., older node). Allow for backwards compat.
+                tracing::debug!(
+                    "Peer {} TLS cert does not contain ed25519 key, skipping TLS verification",
+                    uri
+                );
+            }
+        }
+    }
 
     if !remote_meta.check() {
         let err_msg = format!(
