@@ -1442,7 +1442,7 @@ impl Router {
             }
         }
         if removed > 0 {
-            tracing::warn!("expire_infos: evicted {} nodes, tree now has {} entries (timeout={}s)",
+            tracing::debug!("expire_infos: evicted {} nodes, tree now has {} entries (timeout={}s)",
                 removed, self.infos.len(), self.router_timeout.as_secs());
         }
     }
