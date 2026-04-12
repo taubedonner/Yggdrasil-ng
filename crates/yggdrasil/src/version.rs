@@ -25,6 +25,8 @@ pub enum VersionError {
     BadSignature,
     #[error("incompatible version {0}.{1}")]
     IncompatibleVersion(u16, u16),
+    #[error("invalid field length")]
+    InvalidLength,
     #[error("invalid public key length")]
     InvalidKey,
     #[error("I/O error: {0}")]
@@ -147,24 +149,40 @@ impl Metadata {
             let field_len = u16::from_be_bytes([fields[pos + 2], fields[pos + 3]]) as usize;
             pos += 4;
             if pos + field_len > fields.len() {
-                break;
+                return Err(VersionError::InvalidLength);
             }
+            let field = &fields[pos..pos + field_len];
             match field_id {
-                META_VERSION_MAJOR if field_len >= 2 => {
-                    meta.major_ver = u16::from_be_bytes([fields[pos], fields[pos + 1]]);
+                META_VERSION_MAJOR => {
+                    if field_len != 2 {
+                        return Err(VersionError::InvalidLength);
+                    }
+                    meta.major_ver = u16::from_be_bytes([field[0], field[1]]);
                 }
-                META_VERSION_MINOR if field_len >= 2 => {
-                    meta.minor_ver = u16::from_be_bytes([fields[pos], fields[pos + 1]]);
+                META_VERSION_MINOR => {
+                    if field_len != 2 {
+                        return Err(VersionError::InvalidLength);
+                    }
+                    meta.minor_ver = u16::from_be_bytes([field[0], field[1]]);
                 }
-                META_PUBLIC_KEY if field_len == 32 => {
-                    meta.public_key.copy_from_slice(&fields[pos..pos + 32]);
+                META_PUBLIC_KEY => {
+                    if field_len != 32 {
+                        return Err(VersionError::InvalidLength);
+                    }
+                    meta.public_key.copy_from_slice(field);
                 }
-                META_PRIORITY if field_len >= 1 => {
-                    meta.priority = fields[pos];
+                META_PRIORITY => {
+                    if field_len != 1 {
+                        return Err(VersionError::InvalidLength);
+                    }
+                    meta.priority = field[0];
                 }
                 _ => {} // skip unknown fields
             }
             pos += field_len;
+        }
+        if pos != fields.len() {
+            return Err(VersionError::InvalidLength);
         }
 
         // Verify signature
