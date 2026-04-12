@@ -24,12 +24,14 @@ impl TunAdapter {
     /// `addr`: the Yggdrasil IPv6 address string
     /// `subnet`: the /64 subnet string (for routing)
     /// `mtu`: the MTU for the TUN interface
+    /// `ckr_config`: optional CKR tunnel routing config (for route installation)
     pub async fn new(
         name: &str,
         rwc: Arc<ReadWriteCloser>,
         addr: &str,
         _subnet: &str,
         mtu: u16,
+        #[cfg(feature = "ckr")] ckr_config: Option<&crate::config::TunnelRoutingConfig>,
     ) -> Result<Self, String> {
         if name == "none" {
             return Err("TUN disabled".to_string());
@@ -71,6 +73,14 @@ impl TunAdapter {
         let device = Arc::new(device);
 
         tracing::info!("TUN device '{}' created with address {} and MTU {}", tun_name, addr, mtu);
+
+        // Install CKR routes if configured
+        #[cfg(feature = "ckr")]
+        if let Some(ckr_cfg) = ckr_config {
+            if let Err(e) = crate::ckr::install_routes(ckr_cfg, tun_name) {
+                tracing::error!("Failed to install CKR routes: {}", e);
+            }
+        }
 
         // Channel for packets from network → TUN
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
