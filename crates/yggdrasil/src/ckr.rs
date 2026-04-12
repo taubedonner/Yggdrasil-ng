@@ -252,6 +252,7 @@ mod tests {
         TunnelRoutingConfig {
             enable: true,
             yggdrasil_routing: true,
+            ipv4_address: String::new(),
             remote_subnets: subnets,
         }
     }
@@ -279,6 +280,7 @@ mod tests {
         let config = TunnelRoutingConfig {
             enable: false,
             yggdrasil_routing: true,
+            ipv4_address: String::new(),
             remote_subnets: subnets,
         };
         let ckr = CryptoKey::new(&config).unwrap();

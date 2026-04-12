@@ -108,6 +108,12 @@ pub struct TunnelRoutingConfig {
     #[serde(default = "default_true")]
     pub yggdrasil_routing: bool,
 
+    /// IPv4 address to assign to the TUN interface, in CIDR notation.
+    /// Required for exit-node / VPN scenarios where IPv4 traffic is tunneled.
+    /// Example: "10.99.0.1/24"
+    #[serde(default)]
+    pub ipv4_address: String,
+
     /// Remote subnets: maps hex public key -> list of CIDRs.
     /// Example: { "aabbcc...01": ["10.0.0.0/24", "192.168.1.0/24"] }
     #[serde(default)]
@@ -120,6 +126,7 @@ impl Default for TunnelRoutingConfig {
         Self {
             enable: false,
             yggdrasil_routing: true,
+            ipv4_address: String::new(),
             remote_subnets: HashMap::new(),
         }
     }
