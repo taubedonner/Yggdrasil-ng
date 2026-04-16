@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -78,13 +78,13 @@ impl ReadWriteCloser {
             address,
             subnet,
             lookups: RwLock::new(KeyStoreLookups {
-                key_to_info: HashMap::new(),
-                addr_to_info: HashMap::new(),
-                subnet_to_info: HashMap::new(),
+                key_to_info: HashMap::default(),
+                addr_to_info: HashMap::default(),
+                subnet_to_info: HashMap::default(),
             }),
             buffers: Mutex::new(KeyStoreBuffers {
-                addr_buffer: HashMap::new(),
-                subnet_buffer: HashMap::new(),
+                addr_buffer: HashMap::default(),
+                subnet_buffer: HashMap::default(),
             }),
             mtu,
             #[cfg(feature = "ckr")]
@@ -306,6 +306,18 @@ impl ReadWriteCloser {
 
     /// Update key mappings when we learn about a key (from ironwood path notify or packet receipt).
     pub async fn update_key(&self, key: [u8; 32]) {
+        // Fast path: if key is already known and fresh, skip the write lock entirely.
+        // This avoids taking a write lock on every received packet for a known peer,
+        // which would starve the outbound path's read lock under bidirectional CKR load.
+        {
+            let lookups = self.lookups.read().await;
+            if let Some(info) = lookups.key_to_info.get(&key) {
+                if info.last_seen.elapsed() < KEY_STORE_TIMEOUT / 2 {
+                    return;
+                }
+            }
+        }
+
         let address = addr_for_key(&key);
         let subnet = subnet_for_key(&key);
         tracing::trace!("RWC update_key: learned {} -> {}", address, hex::encode(&key[..8]));

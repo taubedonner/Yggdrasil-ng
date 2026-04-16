@@ -4,7 +4,7 @@
 //! Maintains a cache of known paths to destinations with timeouts.
 //! Throttles lookups to prevent flooding.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::time::{Duration, Instant};
 
 use crate::crypto::{Crypto, PublicKey, Sig};
@@ -108,8 +108,8 @@ impl Pathfinder {
         info.sign(crypto);
         Self {
             info,
-            paths: HashMap::new(),
-            rumors: HashMap::new(),
+            paths: HashMap::default(),
+            rumors: HashMap::default(),
         }
     }
 

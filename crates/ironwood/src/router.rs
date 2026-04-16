@@ -9,7 +9,7 @@
 //! - Greedy routing: forward to neighbor closest in tree-space to destination
 //! - Announcements: gossip ancestry info to peers
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::time::{Duration, Instant};
 
 use crate::bloom::Blooms;
@@ -268,19 +268,19 @@ impl Router {
             crypto,
             pathfinder,
             blooms: Blooms::new(),
-            peers: HashMap::new(),
-            sent: HashMap::new(),
-            ports: HashMap::new(),
-            infos: HashMap::new(),
-            info_times: HashMap::new(),
-            ancs: HashMap::new(),
-            cache: HashMap::new(),
-            lags: HashMap::new(),
-            sig_req_times: HashMap::new(),
-            requests: HashMap::new(),
-            responses: HashMap::new(),
-            responded: HashSet::new(),
-            res_seqs: HashMap::new(),
+            peers: HashMap::default(),
+            sent: HashMap::default(),
+            ports: HashMap::default(),
+            infos: HashMap::default(),
+            info_times: HashMap::default(),
+            ancs: HashMap::default(),
+            cache: HashMap::default(),
+            lags: HashMap::default(),
+            sig_req_times: HashMap::default(),
+            requests: HashMap::default(),
+            responses: HashMap::default(),
+            responded: HashSet::default(),
+            res_seqs: HashMap::default(),
             res_seq_ctr: 0,
             refresh: false,
             do_root1: false,
@@ -403,8 +403,8 @@ impl Router {
         let peer_id = entry.id;
 
         if !self.peers.contains_key(&key) {
-            self.peers.insert(key, HashMap::new());
-            self.sent.insert(key, HashSet::new());
+            self.peers.insert(key, HashMap::default());
+            self.sent.insert(key, HashSet::default());
             self.ports.insert(entry.port, key);
             self.blooms.add_info(key);
         } else {
@@ -914,7 +914,7 @@ impl Router {
 
     /// Get root and distances from a starting node.
     pub fn get_root_and_dists(&self, dest: &PublicKey) -> (PublicKey, HashMap<PublicKey, u64>) {
-        let mut dists = HashMap::new();
+        let mut dists = HashMap::default();
         let mut next = *dest;
         let mut root = [0u8; 32];
         let mut dist = 0u64;
@@ -939,7 +939,7 @@ impl Router {
     /// Get root and path (coordinates) from root to destination.
     pub fn get_root_and_path(&self, dest: &PublicKey) -> (PublicKey, Vec<PeerPort>) {
         let mut ports = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut root;
         let mut next = *dest;
 

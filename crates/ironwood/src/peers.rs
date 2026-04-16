@@ -6,7 +6,7 @@
 //! - **Writer task**: receives outbound frames via an mpsc channel,
 //!   writes them with buffered I/O, manages keepalive and deadlines.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,8 +75,8 @@ impl Peers {
     pub fn new() -> Self {
         Self {
             next_id: 1,
-            used_ports: HashMap::new(),
-            handles: HashMap::new(),
+            used_ports: HashMap::default(),
+            handles: HashMap::default(),
             order: 0,
         }
     }
@@ -125,7 +125,7 @@ impl Peers {
 
         self.handles
             .entry(key)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(id, PeerHandle {
                 id,
                 key,

@@ -6,7 +6,7 @@
 //!
 //! Wire format: [16 bytes: zero flags][16 bytes: ones flags][remaining u64s in big-endian]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use murmur3::murmur3_x64_128;
 use crate::crypto::PublicKey;
 
@@ -140,7 +140,7 @@ pub(crate) struct Blooms {
 impl Blooms {
     pub fn new() -> Self {
         Self {
-            blooms: HashMap::new(),
+            blooms: HashMap::default(),
         }
     }
 

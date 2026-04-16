@@ -3,7 +3,7 @@
 //! Implements Init/Ack/Traffic handshake with 3-tier key ratcheting
 //! and forward secrecy using XSalsa20-Poly1305 (via RustCrypto's `crypto_box` crate).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -569,8 +569,8 @@ pub(crate) struct ConcurrentSessionManager {
 impl ConcurrentSessionManager {
     pub fn new() -> Self {
         Self {
-            sessions: std::sync::RwLock::new(HashMap::new()),
-            buffers: std::sync::Mutex::new(HashMap::new()),
+            sessions: std::sync::RwLock::new(HashMap::default()),
+            buffers: std::sync::Mutex::new(HashMap::default()),
         }
     }
 
