@@ -333,7 +333,7 @@ ipv4_address = "10.99.0.1/24"
 
 [tunnel_routing.remote_subnets]
 # Accept traffic from client's CKR subnet
-"<CLIENT_PUBLIC_KEY>" = ["10.99.0.0/32"]
+"<CLIENT_PUBLIC_KEY>" = ["10.99.0.2/32"]
 ```
 
 #### VPS system setup (Linux)
