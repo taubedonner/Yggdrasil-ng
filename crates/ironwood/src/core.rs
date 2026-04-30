@@ -597,7 +597,7 @@ impl crate::types::PacketConn for PacketConnImpl {
         }
 
         // First, try to pop from the queue (if packets are already buffered)
-        let traffic = if let Some(pkt) = self.delivery_queue.try_pop_or_wait().await {
+        let traffic = if let Some(pkt) = self.delivery_queue.try_pop_or_wait() {
             pkt
         } else {
             // Queue was empty, recv_ready was incremented, now wait on channel
@@ -889,7 +889,7 @@ impl PacketConnImpl {
 
     /// Get a diagnostic snapshot of internal routing state.
     pub async fn get_debug_snapshot(&self) -> DebugSnapshot {
-        let delivery_queue_bytes = self.delivery_queue.queue_size().await;
+        let delivery_queue_bytes = self.delivery_queue.queue_size();
         self.router_handle
             .query_debug_snapshot(delivery_queue_bytes)
             .await

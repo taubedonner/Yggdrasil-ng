@@ -38,6 +38,7 @@ x509-parser = "0.16"
 socket2 = "0.6.3"
 getifaddrs = "0.6"
 rustc-hash = "2.1.2"
+arc-swap = "1.9"
 
 [features]
 default = ["ctl", "tun"]

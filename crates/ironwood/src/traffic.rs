@@ -268,11 +268,12 @@ impl PacketQueue {
 const MAX_PACKET_AGE: Duration = Duration::from_millis(25);
 
 /// DeliveryQueue manages the packet queue with receive-ready counting.
-/// This matches Go's packetconn.go logic where packets are queued when no
-/// reader is waiting, and sent directly when a reader is ready.
+/// Packets are queued when no reader is waiting, and sent directly when a
+/// reader is ready. The queue is guarded by a sync mutex because every
+/// critical section is short and contains no `.await`.
 pub(crate) struct DeliveryQueue {
     /// The underlying packet queue.
-    queue: tokio::sync::Mutex<PacketQueue>,
+    queue: std::sync::Mutex<PacketQueue>,
     /// Number of readers waiting (atomic for lock-free check).
     recv_ready: AtomicUsize,
 }
@@ -280,7 +281,7 @@ pub(crate) struct DeliveryQueue {
 impl DeliveryQueue {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            queue: tokio::sync::Mutex::new(PacketQueue::new()),
+            queue: std::sync::Mutex::new(PacketQueue::new()),
             recv_ready: AtomicUsize::new(0),
         })
     }
@@ -288,7 +289,7 @@ impl DeliveryQueue {
     /// Attempt to deliver a packet. Returns Some(packet) if a reader is waiting
     /// (in which case the caller should send it via channel), or None if the
     /// packet was queued (or dropped due to age).
-    pub async fn deliver(&self, packet: TrafficPacket) -> Option<TrafficPacket> {
+    pub fn deliver(&self, packet: TrafficPacket) -> Option<TrafficPacket> {
         // Fast path: check if a reader is waiting
         if self.recv_ready.load(Ordering::Acquire) > 0 {
             // Decrement recv_ready and return packet for immediate send
@@ -297,7 +298,7 @@ impl DeliveryQueue {
         }
 
         // Slow path: queue the packet
-        let mut queue = self.queue.lock().await;
+        let mut queue = self.queue.lock().unwrap();
 
         // Check if the oldest packet is too old (>25ms), if so drop it
         if let Some(age) = queue.oldest_age() {
@@ -312,14 +313,14 @@ impl DeliveryQueue {
     }
 
     /// Get the current number of bytes queued (snapshot).
-    pub async fn queue_size(&self) -> u64 {
-        self.queue.lock().await.size()
+    pub fn queue_size(&self) -> u64 {
+        self.queue.lock().unwrap().size()
     }
 
     /// Called by read_from() before waiting on channel. Returns Some(packet)
     /// if one is already queued, or None if the reader should wait (recv_ready incremented).
-    pub async fn try_pop_or_wait(&self) -> Option<TrafficPacket> {
-        let mut queue = self.queue.lock().await;
+    pub fn try_pop_or_wait(&self) -> Option<TrafficPacket> {
+        let mut queue = self.queue.lock().unwrap();
 
         if let Some(packet) = queue.pop() {
             // Packet was queued, return it immediately

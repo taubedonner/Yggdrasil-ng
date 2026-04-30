@@ -1,9 +1,10 @@
+use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ironwood::Addr;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 use crate::address::{addr_for_key, is_valid_address, is_valid_subnet, subnet_for_key, Address, Subnet};
 use crate::core::Core;
@@ -18,6 +19,7 @@ const KEY_STORE_TIMEOUT: Duration = Duration::from_secs(120);
 const IPV6_HEADER_LEN: usize = 40;
 
 /// Cached mapping from address/subnet to public key.
+#[derive(Clone)]
 struct KeyInfo {
     address: Address,
     subnet: Subnet,
@@ -36,13 +38,16 @@ pub struct ReadWriteCloser {
     core: Arc<Core>,
     address: Address,
     subnet: Subnet,
-    lookups: RwLock<KeyStoreLookups>,
+    lookups: ArcSwap<KeyStoreLookups>,
+    /// Serializes writers to `lookups` so concurrent updates don't lose changes.
+    lookups_write: std::sync::Mutex<()>,
     buffers: Mutex<KeyStoreBuffers>,
     mtu: u64,
     #[cfg(feature = "ckr")]
     ckr: Option<CryptoKey>,
 }
 
+#[derive(Clone)]
 struct KeyStoreLookups {
     key_to_info: HashMap<[u8; 32], KeyInfo>,
     addr_to_info: HashMap<[u8; 16], [u8; 32]>,
@@ -77,11 +82,12 @@ impl ReadWriteCloser {
             core,
             address,
             subnet,
-            lookups: RwLock::new(KeyStoreLookups {
+            lookups: ArcSwap::from_pointee(KeyStoreLookups {
                 key_to_info: HashMap::default(),
                 addr_to_info: HashMap::default(),
                 subnet_to_info: HashMap::default(),
             }),
+            lookups_write: std::sync::Mutex::new(()),
             buffers: Mutex::new(KeyStoreBuffers {
                 addr_buffer: HashMap::default(),
                 subnet_buffer: HashMap::default(),
@@ -177,7 +183,7 @@ impl ReadWriteCloser {
 
             // Verify source address matches the key we got it from
             let src_valid = {
-                let lookups = self.lookups.read().await;
+                let lookups = self.lookups.load();
                 if let Some(info) = lookups.key_to_info.get(&from_key) {
                     let src_addr_match = src_ip == info.address.0;
                     let mut src_subnet_bytes = [0u8; 8];
@@ -255,7 +261,7 @@ impl ReadWriteCloser {
 
         // Look up the destination key (read-only)
         let key = {
-            let lookups = self.lookups.read().await;
+            let lookups = self.lookups.load();
             if dst_addr_valid {
                 lookups.addr_to_info.get(&dst_ip).copied()
             } else {
@@ -301,11 +307,10 @@ impl ReadWriteCloser {
 
     /// Update key mappings when we learn about a key (from ironwood path notify or packet receipt).
     pub async fn update_key(&self, key: [u8; 32]) {
-        // Fast path: if key is already known and fresh, skip the write lock entirely.
-        // This avoids taking a write lock on every received packet for a known peer,
-        // which would starve the outbound path's read lock under bidirectional CKR load.
+        // Fast path: if key is already known and fresh, skip the write entirely.
+        // The lock-free `ArcSwap::load` makes this nearly free on the hot path.
         {
-            let lookups = self.lookups.read().await;
+            let lookups = self.lookups.load();
             if let Some(info) = lookups.key_to_info.get(&key) {
                 if info.last_seen.elapsed() < KEY_STORE_TIMEOUT / 2 {
                     return;
@@ -318,17 +323,19 @@ impl ReadWriteCloser {
         tracing::trace!("RWC update_key: learned {} -> {}", address, hex::encode(&key[..8]));
         let now = Instant::now();
 
-        // Update lookup maps (write lock)
+        // Update lookup maps via clone-and-swap (writer mutex serializes concurrent updaters).
         {
-            let mut lookups = self.lookups.write().await;
+            let _w = self.lookups_write.lock().unwrap();
+            let mut new = (**self.lookups.load()).clone();
             let info = KeyInfo {
                 address,
                 subnet,
                 last_seen: now,
             };
-            lookups.key_to_info.insert(key, info);
-            lookups.addr_to_info.insert(address.0, key);
-            lookups.subnet_to_info.insert(subnet.0, key);
+            new.key_to_info.insert(key, info);
+            new.addr_to_info.insert(address.0, key);
+            new.subnet_to_info.insert(subnet.0, key);
+            self.lookups.store(Arc::new(new));
         }
 
         // Flush any buffered packets for this address/subnet
@@ -358,19 +365,24 @@ impl ReadWriteCloser {
     pub async fn cleanup(&self) {
         // Remove expired key infos
         {
-            let mut lookups = self.lookups.write().await;
-            let expired_keys: Vec<[u8; 32]> = lookups
+            let _w = self.lookups_write.lock().unwrap();
+            let cur = self.lookups.load();
+            let expired_keys: Vec<[u8; 32]> = cur
                 .key_to_info
                 .iter()
                 .filter(|(_, info)| info.last_seen.elapsed() > KEY_STORE_TIMEOUT)
                 .map(|(key, _)| *key)
                 .collect();
 
-            for key in expired_keys {
-                if let Some(info) = lookups.key_to_info.remove(&key) {
-                    lookups.addr_to_info.remove(&info.address.0);
-                    lookups.subnet_to_info.remove(&info.subnet.0);
+            if !expired_keys.is_empty() {
+                let mut new = (**cur).clone();
+                for key in expired_keys {
+                    if let Some(info) = new.key_to_info.remove(&key) {
+                        new.addr_to_info.remove(&info.address.0);
+                        new.subnet_to_info.remove(&info.subnet.0);
+                    }
                 }
+                self.lookups.store(Arc::new(new));
             }
         }
 
@@ -409,7 +421,7 @@ impl ReadWriteCloser {
             let mut src_ip = [0u8; 16];
             src_ip.copy_from_slice(&packet[8..24]);
 
-            let lookups = self.lookups.read().await;
+            let lookups = self.lookups.load();
             if let Some(info) = lookups.key_to_info.get(from_key) {
                 let src_addr_match = src_ip == info.address.0;
                 let mut src_subnet_bytes = [0u8; 8];
@@ -419,7 +431,6 @@ impl ReadWriteCloser {
                     return true;
                 }
             }
-            drop(lookups);
         }
 
         // For IPv4 or non-Ygg IPv6: validate source against CKR routing table
@@ -483,7 +494,7 @@ impl ReadWriteCloser {
             if dst_addr_valid || dst_subnet_valid {
                 // Use standard Yggdrasil routing path (read-only lookup)
                 let key = {
-                    let lookups = self.lookups.read().await;
+                    let lookups = self.lookups.load();
                     if dst_addr_valid {
                         lookups.addr_to_info.get(&dst_addr_bytes).copied()
                     } else {

@@ -936,7 +936,7 @@ pub(crate) async fn dispatch_actions(
     for action in actions {
         match action {
             RouterAction::DeliverTraffic { traffic } => {
-                if let Some(pkt) = delivery_queue.deliver(traffic).await {
+                if let Some(pkt) = delivery_queue.deliver(traffic) {
                     let _ = traffic_tx.send(pkt).await;
                 }
             }
