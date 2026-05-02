@@ -235,6 +235,63 @@ impl Config {
         CONFIG_TEMPLATE.replace("{{PRIVATE_KEY}}", &key_hex)
     }
 
+    /// Read a TOML config string, add any fields missing from the user's input
+    /// (with their template comments), and return the merged document.
+    /// Preserves user values, formatting, comments, and unknown keys.
+    pub fn normalize_config_text(user_toml: &str) -> Result<String, NormalizeError> {
+        use toml_edit::DocumentMut;
+
+        let mut user_doc: DocumentMut = user_toml.parse().map_err(NormalizeError::ParseUser)?;
+        // Strip the {{PRIVATE_KEY}} placeholder so absent user keys stay empty
+        // (genconf is the path that mints keys; normalize must be deterministic).
+        let template_text = CONFIG_TEMPLATE.replace("{{PRIVATE_KEY}}", "");
+        let template_doc: DocumentMut =
+            template_text.parse().map_err(NormalizeError::ParseTemplate)?;
+
+        merge_missing(user_doc.as_table_mut(), template_doc.as_table());
+        Ok(user_doc.to_string())
+    }
+}
+
+/// Errors returned by [`Config::normalize_config_text`].
+#[derive(Debug, thiserror::Error)]
+pub enum NormalizeError {
+    #[error("invalid input TOML: {0}")]
+    ParseUser(toml_edit::TomlError),
+    #[error("internal: template TOML is invalid: {0}")]
+    ParseTemplate(toml_edit::TomlError),
+}
+
+/// Walk `from` in declaration order; for each key absent from `into`, splice
+/// in a clone of the template entry (with its leading comment decor). For
+/// keys present on both sides as tables, recurse. Never overwrite the user's
+/// values, never delete unknown keys.
+fn merge_missing(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    for (key, template_item) in from.iter() {
+        match into.get_mut(key) {
+            None => {
+                into.insert(key, template_item.clone());
+                // Preserve the template's leading comment decor on the key.
+                if let Some(template_key) = from.key(key) {
+                    if let Some(mut user_key) = into.key_mut(key) {
+                        *user_key.leaf_decor_mut() = template_key.leaf_decor().clone();
+                    }
+                }
+            }
+            Some(user_item) => {
+                if let (Some(user_tbl), Some(template_tbl)) =
+                    (user_item.as_table_mut(), template_item.as_table())
+                {
+                    merge_missing(user_tbl, template_tbl);
+                }
+                // Arrays-of-tables and scalars: leave the user's choice alone.
+            }
+        }
+    }
+}
+
+impl Config {
+
     /// Parse the private key from hex.
     pub fn signing_key(&self) -> Result<SigningKey, String> {
         if self.private_key.is_empty() {
@@ -322,5 +379,108 @@ fn toml_to_json(toml_val: &toml::Value) -> serde_json::Value {
                 .collect();
             serde_json::Value::Object(json_obj)
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_full_config_is_stable() {
+        let generated = Config::generate_config_text();
+        let normalized = Config::normalize_config_text(&generated).unwrap();
+        // After re-running normalize on the output, no further changes should appear.
+        let twice = Config::normalize_config_text(&normalized).unwrap();
+        assert_eq!(normalized, twice, "normalize must be idempotent");
+        // The generated config already deserializes — the normalized one must too.
+        toml::from_str::<Config>(&normalized).expect("normalized output is valid Config TOML");
+    }
+
+    #[test]
+    fn user_inline_comment_is_preserved() {
+        let input = "if_mtu = 1280  # custom for my LTE link\n";
+        let out = Config::normalize_config_text(input).unwrap();
+        assert!(
+            out.contains("# custom for my LTE link"),
+            "user comment dropped:\n{out}"
+        );
+        assert!(out.contains("1280"), "user value dropped:\n{out}");
+    }
+
+    #[test]
+    fn missing_firewall_section_is_added() {
+        let input = "private_key = \"\"\n";
+        let out = Config::normalize_config_text(input).unwrap();
+        assert!(out.contains("[firewall]"), "[firewall] not added:\n{out}");
+        assert!(
+            out.contains("enable = false"),
+            "firewall defaults missing:\n{out}"
+        );
+        assert!(out.contains("open_tcp"), "open_tcp missing:\n{out}");
+    }
+
+    #[test]
+    fn user_value_is_not_overwritten() {
+        let input = "if_mtu = 1280\n";
+        let out = Config::normalize_config_text(input).unwrap();
+        assert!(out.contains("if_mtu = 1280"), "if_mtu rewritten:\n{out}");
+        assert!(
+            !out.contains("if_mtu = 65535"),
+            "template default leaked over user value:\n{out}"
+        );
+    }
+
+    #[test]
+    fn empty_array_with_user_comment_is_preserved() {
+        let input = "peers = []  # I'll add some later\n";
+        let out = Config::normalize_config_text(input).unwrap();
+        assert!(
+            out.contains("# I'll add some later"),
+            "user array comment dropped:\n{out}"
+        );
+        assert!(out.contains("peers = []"), "peers rewritten:\n{out}");
+    }
+
+    #[test]
+    fn unknown_user_keys_are_kept() {
+        let input = "experimental_thing = \"x\"\n";
+        let out = Config::normalize_config_text(input).unwrap();
+        assert!(
+            out.contains("experimental_thing = \"x\""),
+            "unknown key dropped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn custom_node_info_table_passes_through() {
+        let input = "[node_info]\nname = \"foo\"  # set by ansible\n";
+        let out = Config::normalize_config_text(input).unwrap();
+        assert!(out.contains("[node_info]"));
+        assert!(out.contains("name = \"foo\""));
+        assert!(out.contains("# set by ansible"));
+    }
+
+    #[test]
+    fn invalid_toml_returns_parse_user_error() {
+        let bad = "this is = = not toml\n";
+        let err = Config::normalize_config_text(bad).unwrap_err();
+        match err {
+            NormalizeError::ParseUser(_) => {}
+            other => panic!("expected ParseUser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_template_minus_private_key() {
+        let out = Config::normalize_config_text("").unwrap();
+        // Should have all the schema scaffolding…
+        assert!(out.contains("[firewall]"));
+        assert!(out.contains("if_name"));
+        // …but no fresh keypair (genconf's job).
+        assert!(
+            out.contains("private_key = \"\""),
+            "normalize must not mint a key:\n{out}"
+        );
     }
 }

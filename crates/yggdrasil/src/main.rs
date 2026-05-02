@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut opts = Options::new();
     opts.optflagopt("g", "genconf", "Generate a new configuration (optionally save to FILE)", "FILE");
+    opts.optflagopt("", "normalize", "Normalize a config: read from FILE (or stdin if absent), add any missing fields with defaults while preserving user values and comments, and print to stdout", "FILE");
     opts.optopt("c", "config", "Config file path (default: yggdrasil.toml)", "FILE");
     opts.optflag("", "autoconf", "Run without a configuration file (use ephemeral keys)");
     opts.optflag("a", "address", "Print the IPv6 address for the given config and exit");
@@ -105,6 +106,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", Config::generate_config_text());
         }
         return Ok(());
+    }
+
+    // --normalize [FILE]: read existing config (file or stdin), splice in
+    // any new fields with their template comments, print to stdout.
+    if matches.opt_present("normalize") {
+        use std::io::Read;
+        let mut buf = String::new();
+        match matches.opt_str("normalize") {
+            Some(path) if path != "-" => {
+                File::open(&path)?.read_to_string(&mut buf)?;
+            }
+            _ => {
+                std::io::stdin().read_to_string(&mut buf)?;
+            }
+        }
+        match Config::normalize_config_text(&buf) {
+            Ok(out) => {
+                print!("{}", out);
+                if !out.ends_with('\n') {
+                    println!();
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     // Initialize logging
