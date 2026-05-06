@@ -15,7 +15,8 @@ private_key = "{{PRIVATE_KEY}}"
 # Optional query parameters:
 #   key=HEX          - pin the remote peer's public key (connection fails if mismatch)
 #   password=SECRET  - shared password, must match the listener side (max 64 chars)
-#   priority=N       - connection priority 0–255, lower = preferred (default: 0)
+#   priority=N       - connection priority 0-255, lower = preferred when multiple
+#                      connections exist to the same peer (default: 0)
 #   maxbackoff=DUR   - max reconnect wait if peer goes offline, e.g. 30s, 5m, 1h
 #                      (default: 4096s ≈ 68 min, minimum: 5s)
 #   sni=HOSTNAME     - override TLS SNI hostname, useful when connecting via IP
@@ -72,8 +73,8 @@ if_mtu = 65535
 # beacon   - advertise this node's presence on matching interfaces (default: true)
 # listen   - connect to other nodes discovered on matching interfaces (default: true)
 # port     - TLS listener port for this interface, 0 = auto-assign (default: 0)
-# priority - connection priority for peers found on this interface,
-#            lower = preferred when the same peer is reachable via multiple paths (default: 0)
+# priority - connection priority for peers found on this interface (0-255, lower = preferred),
+#            used when the same peer is reachable via multiple connections
 # password - shared password for discovery; only nodes with the same password
 #            will discover each other on this interface (default: none)
 [[multicast_interfaces]]

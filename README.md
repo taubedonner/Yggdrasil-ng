@@ -30,7 +30,6 @@ This project aims to provide a lightweight, self-arranging, and secure mesh netw
 - Crypto-Key Routing (CKR) — tunnel arbitrary IPv4/IPv6 subnets through the mesh (`--features ckr`)
 
 **⏳ Planned Features:**
-- Additional transports: QUIC, WebSocket
 - Multicast peer discovery on local networks
 - Performance optimizations and protocol improvements
 
@@ -248,7 +247,7 @@ Both `peers` entries and `listen` addresses support optional query-string parame
 |-----------|-------------|---------|
 | `password=PASSWORD` | Shared secret required to connect (max 64 chars, must match remote side) | `?password=secret` |
 | `key=PUBLICKEY` | Pin the expected public key (hex); connection fails if remote key differs | `?key=aabbcc...` |
-| `priority=N` | Connection priority (0–255, lower = higher priority) for path selection | `?priority=10` |
+| `priority=N` | Connection priority (0-255, lower = higher priority) when multiple connections exist to the same peer | `?priority=10` |
 | `maxbackoff=DURATION` | Maximum reconnect backoff interval if the peer goes down (min 5s, default 68m) | `?maxbackoff=30s` |
 | `sni=HOSTNAME` | Override TLS SNI hostname (TLS only; ignored for plain TCP) | `?sni=example.com` |
 
@@ -294,13 +293,13 @@ peers = [
   - `node_info_privacy` instead of `NodeInfoPrivacy`
   - `allowed_public_keys` instead of `AllowedPublicKeys`
 - **Single binary**: Daemon and control tool are combined (no separate `yggdrasilctl`)
-- **Transport support**: TCP and TLS (QUIC, WebSocket coming later)
+- **Transport support**: TCP and TLS only
 - **Admin socket**: Defaults to TCP `localhost:9001` instead of Unix socket
 
 **Migration from Go config:**
 1. Convert HJSON/JSON to TOML format
 2. Rename all fields from PascalCase to snake_case
-3. Change transport URIs as needed (QUIC and WebSocket not yet supported — use `tcp://` or `tls://`)
+3. Change transport URIs as needed (QUIC and WebSocket are not supported — use `tcp://` or `tls://`)
 4. Update admin socket to TCP format if using Unix socket
 
 ## Crypto-Key Routing (CKR)
